@@ -19,13 +19,18 @@
     Use -NoGui to print a console table instead (useful for scheduled tasks or when no
     interactive desktop session is available).
 
-    Zero-configuration usage: run this script directly on the SCCM site server with no
-    parameters (double-click Run-SCCMHealthDashboard.cmd, or right-click the .ps1 and
-    choose "Run with PowerShell"). It defaults to the local computer as the provider,
-    auto-detects the site code, and enumerates every site system and role from there -
-    nothing needs to be edited. Checks against the local machine itself use local WMI
-    directly (no remote CIM session), avoiding "Access is denied" failures some
-    patched Windows Server builds throw when a machine connects to itself over DCOM.
+    Zero-configuration usage: run this single file directly on the SCCM site server with
+    no parameters - right-click it and choose "Run with PowerShell" (which also bypasses
+    the machine's execution policy automatically), or run it from an existing console
+    with `.\SCCM-SiteSystemHealthDashboard.ps1`. It defaults to the local computer as the
+    provider, auto-detects the site code, and enumerates every site system and role from
+    there - nothing needs to be edited, and there is no separate launcher file. Checks
+    against the local machine itself use local WMI directly (no remote CIM session),
+    avoiding "Access is denied" failures some patched Windows Server builds throw when a
+    machine connects to itself over DCOM. If the GUI is requested but the process isn't
+    running single-threaded apartment (required by WinForms - Windows PowerShell is STA
+    by default, but PowerShell 7's `pwsh` defaults to MTA), the script transparently
+    relaunches itself with -STA so the dashboard still works with no extra steps.
 
     The role -> port and role -> service mappings in the CONFIGURATION section are
     best-effort defaults for a typical Configuration Manager hierarchy. Environments
@@ -92,6 +97,39 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+#region ================= self-relaunch in STA (WinForms requires it) =================
+
+# WinForms requires a single-threaded apartment. Windows PowerShell (powershell.exe) is
+# STA by default, but PowerShell 7's pwsh.exe defaults to MTA and would crash when the
+# dashboard tries to open. Detect that case and transparently relaunch this same file
+# with -STA so the script still "just works" with no separate launcher and no manual
+# -STA flag to remember. Skipped entirely for -NoGui, which never touches WinForms.
+if (-not $NoGui -and [System.Threading.Thread]::CurrentThread.ApartmentState -ne 'STA' -and $PSCommandPath) {
+    Write-Host 'Relaunching in a single-threaded apartment (required for the GUI dashboard)...'
+    # Start-Process -ArgumentList joins the array with plain spaces (no auto-quoting), so
+    # every element that could itself contain a space must be quoted here explicitly.
+    $relaunchArgs = @('-NoLogo', '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
+    foreach ($key in $PSBoundParameters.Keys) {
+        $value = $PSBoundParameters[$key]
+        if ($value -is [System.Management.Automation.PSCredential]) {
+            Write-Warning "Cannot forward -Credential across the automatic -STA relaunch. Launch PowerShell yourself with -STA, e.g.: powershell.exe -STA -File `"$PSCommandPath`" -Credential (Get-Credential) ..."
+            continue
+        }
+        if ($value -is [switch]) {
+            if ($value.IsPresent) { $relaunchArgs += "-$key" }
+        }
+        else {
+            $relaunchArgs += "-$key"
+            $relaunchArgs += "`"$value`""
+        }
+    }
+    $hostExePath = (Get-Process -Id $PID).Path
+    $proc = Start-Process -FilePath $hostExePath -ArgumentList $relaunchArgs -Wait -PassThru -NoNewWindow
+    exit $proc.ExitCode
+}
+
+#endregion
 
 #region ================= CONFIGURATION (edit to match your environment) =================
 
