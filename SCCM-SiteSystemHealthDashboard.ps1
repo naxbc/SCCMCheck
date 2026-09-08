@@ -19,14 +19,24 @@
     Use -NoGui to print a console table instead (useful for scheduled tasks or when no
     interactive desktop session is available).
 
+    Zero-configuration usage: run this script directly on the SCCM site server with no
+    parameters (double-click Run-SCCMHealthDashboard.cmd, or right-click the .ps1 and
+    choose "Run with PowerShell"). It defaults to the local computer as the provider,
+    auto-detects the site code, and enumerates every site system and role from there -
+    nothing needs to be edited. Checks against the local machine itself use local WMI
+    directly (no remote CIM session), avoiding "Access is denied" failures some
+    patched Windows Server builds throw when a machine connects to itself over DCOM.
+
     The role -> port and role -> service mappings in the CONFIGURATION section are
     best-effort defaults for a typical Configuration Manager hierarchy. Environments
     that use non-default ports (custom HTTPS bindings, WSUS on 80/443 instead of
-    8530/8531, named SQL instances, etc.) should edit that section to match.
+    8530/8531, named SQL instances, etc.) can edit that section to match, but this is
+    optional - the script runs unedited out of the box.
 
 .PARAMETER ProviderMachineName
     The SMS Provider / site server to query for site system and role data. Defaults to
-    the local computer name (run the script on the site server, or point it at one).
+    the local computer name, so running the script on the site server itself needs no
+    parameters at all.
 
 .PARAMETER SiteCode
     The 3-character SCCM site code. If omitted, it is auto-detected from
@@ -160,6 +170,18 @@ function New-SccmCimSessionOption {
     else { New-CimSessionOption -Protocol Dcom }
 }
 
+function Test-IsLocalComputer {
+    # Treat the target as local if its short name matches this machine's computer name.
+    # Talking to yourself over a remote CIM/DCOM session can fail with "Access is denied"
+    # on Windows Server after the 2023 DCOM hardening update, so local targets always use
+    # plain (session-less) WMI calls instead.
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    if ($Name -eq '.' -or $Name -ieq 'localhost' -or $Name -eq '127.0.0.1') { return $true }
+    $shortName = ($Name -split '\.')[0]
+    return $shortName -ieq $env:COMPUTERNAME
+}
+
 function Get-SccmSiteCode {
     [CmdletBinding()]
     param(
@@ -168,15 +190,20 @@ function Get-SccmSiteCode {
         [string]$Protocol = 'Dcom'
     )
 
-    $sessionParams = @{
-        ComputerName  = $ProviderMachineName
-        SessionOption = New-SccmCimSessionOption -Protocol $Protocol
-    }
-    if ($Credential) { $sessionParams['Credential'] = $Credential }
-
-    $session = New-CimSession @sessionParams
+    $session = $null
     try {
-        $locations = Get-CimInstance -CimSession $session -Namespace 'root\sms' -ClassName 'SMS_ProviderLocation'
+        $cimParams = @{}
+        if (-not (Test-IsLocalComputer -Name $ProviderMachineName)) {
+            $sessionParams = @{
+                ComputerName  = $ProviderMachineName
+                SessionOption = New-SccmCimSessionOption -Protocol $Protocol
+            }
+            if ($Credential) { $sessionParams['Credential'] = $Credential }
+            $session = New-CimSession @sessionParams
+            $cimParams = @{ CimSession = $session }
+        }
+
+        $locations = Get-CimInstance @cimParams -Namespace 'root\sms' -ClassName 'SMS_ProviderLocation'
         $loc = $locations | Where-Object { $_.ProviderForLocalSite } | Select-Object -First 1
         if (-not $loc) { $loc = $locations | Select-Object -First 1 }
         if (-not $loc) {
@@ -185,7 +212,7 @@ function Get-SccmSiteCode {
         return $loc.SiteCode
     }
     finally {
-        Remove-CimSession -CimSession $session -ErrorAction SilentlyContinue
+        if ($session) { Remove-CimSession -CimSession $session -ErrorAction SilentlyContinue }
     }
 }
 
@@ -198,17 +225,22 @@ function Get-SccmSiteSystemRoles {
         [string]$Protocol = 'Dcom'
     )
 
-    $sessionParams = @{
-        ComputerName  = $ProviderMachineName
-        SessionOption = New-SccmCimSessionOption -Protocol $Protocol
-    }
-    if ($Credential) { $sessionParams['Credential'] = $Credential }
-
-    $session = New-CimSession @sessionParams
+    $session = $null
     try {
+        $cimParams = @{}
+        if (-not (Test-IsLocalComputer -Name $ProviderMachineName)) {
+            $sessionParams = @{
+                ComputerName  = $ProviderMachineName
+                SessionOption = New-SccmCimSessionOption -Protocol $Protocol
+            }
+            if ($Credential) { $sessionParams['Credential'] = $Credential }
+            $session = New-CimSession @sessionParams
+            $cimParams = @{ CimSession = $session }
+        }
+
         $namespace = "root\sms\site_$SiteCode"
         try {
-            $rows = Get-CimInstance -CimSession $session -Namespace $namespace -ClassName 'SMS_SCI_SysResUse'
+            $rows = Get-CimInstance @cimParams -Namespace $namespace -ClassName 'SMS_SCI_SysResUse'
         }
         catch {
             throw "Failed to query site system roles from '$ProviderMachineName' (namespace '$namespace'). Verify the site code, that the SMS Provider is reachable, and that the account has read access. Underlying error: $($_.Exception.Message)"
@@ -225,7 +257,7 @@ function Get-SccmSiteSystemRoles {
         }
     }
     finally {
-        Remove-CimSession -CimSession $session -ErrorAction SilentlyContinue
+        if ($session) { Remove-CimSession -CimSession $session -ErrorAction SilentlyContinue }
     }
 }
 
@@ -258,15 +290,17 @@ function Test-TcpPort {
     }
 }
 
-function Get-RemoteServiceState {
+function Get-ServiceState {
+    # $CimParams is either @{} (query the local machine directly, no session) or
+    # @{ CimSession = <session> } (query a remote machine).
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]$CimSession,
+        [Parameter(Mandatory)][hashtable]$CimParams,
         [Parameter(Mandatory)][string]$ServiceName
     )
 
     try {
-        $svc = Get-CimInstance -CimSession $CimSession -ClassName 'Win32_Service' -Filter "Name='$ServiceName'" -ErrorAction Stop
+        $svc = Get-CimInstance @CimParams -ClassName 'Win32_Service' -Filter "Name='$ServiceName'" -ErrorAction Stop
         if (-not $svc) {
             return [pscustomobject]@{ Name = $ServiceName; State = 'NotInstalled' }
         }
@@ -292,11 +326,20 @@ function Invoke-SccmHealthScan {
         throw "No site system role data returned from '$ProviderMachineName' for site '$SiteCode'."
     }
 
-    $cimSessionCache = @{}
+    $cimConnCache = @{}
 
-    function Get-CachedCimSession {
+    function Get-CachedCimParams {
+        # Returns @{} for the local machine (session-less local WMI), @{ CimSession = <session> }
+        # for a remote machine (cached per server for reuse across roles/services), or $null if a
+        # remote session could not be established.
         param([string]$Server)
-        if ($cimSessionCache.ContainsKey($Server)) { return $cimSessionCache[$Server] }
+        if ($cimConnCache.ContainsKey($Server)) { return $cimConnCache[$Server] }
+
+        if (Test-IsLocalComputer -Name $Server) {
+            $cimConnCache[$Server] = @{}
+            return $cimConnCache[$Server]
+        }
+
         $sessionParams = @{
             ComputerName        = $Server
             SessionOption       = New-SccmCimSessionOption -Protocol $Protocol
@@ -304,13 +347,13 @@ function Invoke-SccmHealthScan {
         }
         if ($Credential) { $sessionParams['Credential'] = $Credential }
         try {
-            $s = New-CimSession @sessionParams -ErrorAction Stop
+            $session = New-CimSession @sessionParams -ErrorAction Stop
+            $cimConnCache[$Server] = @{ CimSession = $session }
         }
         catch {
-            $s = $null
+            $cimConnCache[$Server] = $null
         }
-        $cimSessionCache[$Server] = $s
-        return $s
+        return $cimConnCache[$Server]
     }
 
     function New-HealthRow {
@@ -338,10 +381,10 @@ function Invoke-SccmHealthScan {
         $anyServiceDown = $false
         $anyServiceUnknown = $false
         if ($PingOk -and $ServiceNames.Count -gt 0) {
-            $session = Get-CachedCimSession -Server $Server
+            $cimParams = Get-CachedCimParams -Server $Server
             foreach ($svcName in $ServiceNames) {
-                if ($session) {
-                    $state = Get-RemoteServiceState -CimSession $session -ServiceName $svcName
+                if ($cimParams) {
+                    $state = Get-ServiceState -CimParams $cimParams -ServiceName $svcName
                     $svcDetails.Add("$svcName=$($state.State)")
                     if ($state.State -eq 'QueryFailed') { $anyServiceUnknown = $true }
                     elseif ($state.State -ne 'Running' -and $state.State -ne 'NotInstalled') { $anyServiceDown = $true }
@@ -417,8 +460,10 @@ function Invoke-SccmHealthScan {
         $results.Add((New-HealthRow -Server $server -Role 'Core SCCM Services' -PingOk $pingOk -Ports @() -ServiceNames $CoreSccmServices -ScanTime $scanTime))
     }
 
-    foreach ($s in $cimSessionCache.Values) {
-        if ($s) { Remove-CimSession -CimSession $s -ErrorAction SilentlyContinue }
+    foreach ($conn in $cimConnCache.Values) {
+        if ($conn -and $conn.ContainsKey('CimSession')) {
+            Remove-CimSession -CimSession $conn['CimSession'] -ErrorAction SilentlyContinue
+        }
     }
 
     return , ($results.ToArray() | Sort-Object Server, Role)
